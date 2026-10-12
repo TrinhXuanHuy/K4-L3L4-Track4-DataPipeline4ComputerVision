@@ -183,11 +183,13 @@ Câu SQL bạn thêm vào dashboard và điều nó cho biết:
 SELECT 
     trip_id,
     drive_id,
-    total_frames,
-    black_frames,
-    blurry_frames,
-    near_dup_frames,
-    ROUND((black_frames + blurry_frames + near_dup_frames) * 100.0 / total_frames, 2) AS pct_bad_frames
+    frames AS total_frames,
+    frames_kept,
+    (frames - frames_kept) AS bad_frames,
+    ROUND((frames - frames_kept) * 100.0 / frames, 2) AS pct_bad_frames,
+    avg_speed_kmh,
+    conditions,
+    lighting
 FROM marts.mart_trip_summary
 ORDER BY pct_bad_frames DESC
 LIMIT 5;
@@ -204,3 +206,62 @@ LIMIT 5;
 - **Bất ngờ nhất:** Tác động to lớn của việc chia split dữ liệu theo trip so với chia theo khung hình: chia ngẫu nhiên theo khung hình làm rò rỉ 100% trip giữa Train và Test, khiến model học vẹt mà ta không hề hay biết nếu không kiểm tra leakage.
 - **Điều còn chưa rõ:** Cách xác định ngưỡng dung sai thời gian `sync_tol_ms` một cách tự động khi xe chạy qua nhiều địa hình có tần số lấy mẫu telemetry dao động bất thường mà không cần cấu hình tĩnh.
 - **Lỗi dữ liệu pipeline chưa bắt được:** Hiện tượng giọt nước mưa, bùn đất bắn lên che một góc ống kính (camera partial occlusion) hoặc đèn pha xe đối diện chiếu thẳng vào gây lóa sáng cục bộ (lens flare). Các khung hình này không bị coi là đen, mờ hay trùng nhưng đã bị mất thông tin làn đường quan trọng.
+
+## Điểm cộng (Bonus)
+
+### 1. Thí nghiệm riêng của sinh viên: Khảo sát độ nhạy của tham số dung sai đồng bộ thời gian `sync_tol_ms`
+
+- **Mục tiêu thí nghiệm:** 
+  Đánh giá tác động định lượng của tham số `sync_tol_ms` (mặc định `150 ms` trong `dbt/dbt_project.yml`) đối với tỷ lệ mất đồng bộ khung hình (`sync_lost`) ở tầng Silver và quy mô tập dữ liệu huấn luyện Gold (`gold_dataset_frames`).
+- **Phương pháp thực hiện:**
+  Khảo sát phân bố thời gian trễ `sync_gap_ms` trên toàn bộ 1.246 khung hình thu nhận từ video (`lake.silver_frame_telemetry`) khi ghép cặp ASOF join (`event_time >= ts`) với telemetry của xe:
+  - Giá trị nhỏ nhất `min(sync_gap_ms)`: `0 ms`.
+  - Giá trị trung bình `avg(sync_gap_ms)`: `69.57 ms` (Drive A trung bình `66.0 ms`, Drive B trung bình `73.0 ms`).
+  - Giá trị lớn nhất `max(sync_gap_ms)`: `3.112 ms` (khoảng mất tín hiệu telemetry do gián đoạn truyền tin).
+- **Kết quả đo đạc định lượng thực nghiệm:**
+
+| Tham số `sync_tol_ms` | Khung hình hợp lệ (`sync_ok`) | Khung hình mất đồng bộ (`sync_lost`) | Tỷ lệ mất đồng bộ (%) | Quy mô tập Gold (`gold_dataset_frames`) | Biến động tập Gold so với chuẩn 150ms |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **150 ms (Chuẩn đề bài)** | **1.232** | **14** | **1.12%** | **1.019 khung hình** | **0% (Mốc đối chứng)** |
+| **100 ms** | 922 | 324 | 26.00% | 762 khung hình | **−25.22%** (−257 khung hình) |
+| **50 ms** | 646 | 600 | 48.15% | 538 khung hình | **−47.20%** (−481 khung hình) |
+| **20 ms** | 646 | 600 | 48.15% | 538 khung hình | **−47.20%** (−481 khung hình) |
+
+- **Phân tích và kết luận vận hành:**
+  1. Video được trích xuất với tốc độ 10 fps (chu kỳ 100 ms/khung hình), trong khi cảm biến telemetry phát dữ liệu với tần số xấp xỉ 10–20 Hz. Do đó, độ trễ ghép cặp trung bình giữa khung hình và điểm telemetry gần nhất trước đó là `~70 ms`.
+  2. Nếu siết chặt dung sai xuống `50 ms`, ngưỡng này nhỏ hơn độ trễ lấy mẫu tự nhiên của hệ thống, khiến gần một nửa dữ liệu (48.15% khung hình) bị loại bỏ oan uổng, làm dung lượng tập Gold giảm nghiêm trọng từ 1.019 xuống 538 khung hình.
+  3. Ngưỡng `sync_tol_ms = 150 ms` của đề bài là ngưỡng tối ưu (sweet spot): vừa đủ dung sai cho độ lệch chu kỳ lấy mẫu tự nhiên (giữ lại 98.88% dữ liệu), vừa loại bỏ chính xác 14 khung hình rơi vào khoảng gián đoạn telemetry thực sự (>150 ms).
+
+---
+
+### 2. Câu hỏi Metabase thứ hai: Đánh giá chất lượng dữ liệu và kiểm tra cân bằng điều kiện môi trường giữa các split
+
+- **Câu SQL vận hành trên Data Warehouse (`marts.mart_trip_summary`):**
+
+```sql
+SELECT 
+    split,
+    lighting,
+    conditions,
+    COUNT(trip_id) AS num_trips,
+    SUM(frames) AS total_raw_frames,
+    SUM(frames_kept) AS total_valid_frames,
+    ROUND(AVG(avg_speed_kmh)::numeric, 2) AS mean_speed_kmh,
+    ROUND(AVG((frames - frames_kept) * 100.0 / frames)::numeric, 2) AS avg_pct_dropped
+FROM marts.mart_trip_summary
+GROUP BY split, lighting, conditions
+ORDER BY split, total_valid_frames DESC;
+```
+
+- **Kết quả truy vấn thực tế:**
+
+| split | lighting | conditions | num_trips | total_raw_frames | total_valid_frames | mean_speed_kmh | avg_pct_dropped |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **test** | Day | Clouds | 4 | 224 | 160 | 41.30 km/h | 26.38% |
+| **train** | Day | Clouds | 18 | 842 | 702 | 52.65 km/h | 17.41% |
+| **val** | Day | Clouds | 4 | 180 | 157 | 57.50 km/h | 12.22% |
+
+- **Ý nghĩa vận hành thực tế:**
+  1. **Kiểm tra độ cân bằng môi trường lái xe (Domain Shift):** Truy vấn cho thấy toàn bộ các chuyến đi thu thập đều nằm trong điều kiện ban ngày có mây (`Day / Clouds`). Điều này chứng minh không có sự lệch phân phối về điều kiện thời tiết hay ánh sáng giữa tập Train, Val và Test.
+  2. **Phân tích hành vi tốc độ và tỷ lệ loại bỏ:** Tập Test có tốc độ di chuyển trung bình thấp hơn (`41.30 km/h`) và tỷ lệ khung hình bị loại cao hơn (`26.38%`) so với Train (`17.41%`) và Val (`12.22%`). Nguyên nhân là tập Test ngẫu nhiên nhận chuyến đi `trip-08888` (thuộc Drive A, có vận tốc trung bình rất thấp chỉ `6.5 km/h` do xe bị tắc đường/dừng đèn đỏ, dẫn đến nhiều khung hình đứng yên trùng lặp bị lọc bỏ).
+  3. Chỉ số này giúp đội ngũ Data Engineering cảnh báo cho nhóm huấn luyện mô hình thị giác máy tính về sự khác biệt vận tốc giữa các tập nhằm tránh thiên kiến suy luận (inference bias) khi xe tự lái vận hành ở dải tốc độ cao.
